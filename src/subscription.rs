@@ -11,6 +11,7 @@ use zbus::{Connection, fdo, zvariant};
 
 use crate::access::Access;
 use crate::file_chooser::FileChooser;
+use crate::input_capture::InputCapture;
 use crate::screencast::ScreenCast;
 use crate::screenshot::Screenshot;
 use crate::{
@@ -98,6 +99,7 @@ pub(crate) async fn process_changes(
                     DBUS_PATH,
                     ScreenCast::new(wayland_helper.clone(), tx.clone()),
                 )?
+                .serve_at(DBUS_PATH, InputCapture::new(tx.clone()))?
                 .serve_at(DBUS_PATH, Settings::new())?
                 .build()
                 .await?;

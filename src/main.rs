@@ -15,6 +15,7 @@ mod app;
 mod buffer;
 mod documents;
 mod file_chooser;
+mod input_capture;
 mod localize;
 mod remote_desktop;
 mod remote_desktop_dialog;

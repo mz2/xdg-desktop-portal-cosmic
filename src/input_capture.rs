@@ -233,18 +233,7 @@ impl InputCapture {
 
             let position = barrier_dict
                 .get("position")
-                .and_then(|v| {
-                    let s = zvariant::Structure::try_from(v.as_ref()).ok()?;
-                    let fields = s.into_fields();
-                    if fields.len() != 4 {
-                        return None;
-                    }
-                    let x1 = i32::try_from(&fields[0]).ok()?;
-                    let y1 = i32::try_from(&fields[1]).ok()?;
-                    let x2 = i32::try_from(&fields[2]).ok()?;
-                    let y2 = i32::try_from(&fields[3]).ok()?;
-                    Some((x1, y1, x2, y2))
-                });
+                .and_then(|v| <(i32, i32, i32, i32)>::try_from(v.clone()).ok());
 
             if barrier_id == 0 {
                 continue;
@@ -370,16 +359,7 @@ impl InputCapture {
             .and_then(|v| <u32>::try_from(v).ok());
         let _cursor_position = options
             .get("cursor_position")
-            .and_then(|v| {
-                let s = zvariant::Structure::try_from(v.as_ref()).ok()?;
-                let fields = s.into_fields();
-                if fields.len() != 2 {
-                    return None;
-                }
-                let x = f64::try_from(&fields[0]).ok()?;
-                let y = f64::try_from(&fields[1]).ok()?;
-                Some((x, y))
-            });
+            .and_then(|v| <(f64, f64)>::try_from(v.clone()).ok());
 
         session_data.state = Some(SessionState::Disabled);
         log::info!("InputCapture: Released for session {}", session_handle);

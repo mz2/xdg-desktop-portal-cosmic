@@ -291,7 +291,7 @@ impl InputCapture {
 
         let mut session_data = interface.get_mut().await;
         match session_data.state {
-            Some(SessionState::Disabled) | Some(SessionState::Started) => {
+            Some(SessionState::Disabled) | Some(SessionState::Started) | Some(SessionState::Created) => {
                 session_data.state = Some(SessionState::Enabled);
                 log::info!("InputCapture: Enabled for session {}", session_handle);
                 // TODO: Forward Enable to compositor via private D-Bus

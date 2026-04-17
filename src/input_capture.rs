@@ -94,15 +94,17 @@ impl InputCapture {
 #[zbus::interface(name = "org.freedesktop.impl.portal.InputCapture")]
 impl InputCapture {
     // CreateSession method (called by xdg-desktop-portal frontend)
+    // Signature: (o handle, o session_handle, s app_id, s parent_window, a{sv} options)
     async fn create_session(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         handle: zvariant::ObjectPath<'_>,
         session_handle: zvariant::ObjectPath<'_>,
         app_id: String,
+        parent_window: String,
         options: HashMap<String, zvariant::OwnedValue>,
     ) -> PortalResponse<CreateSessionResult> {
-        log::info!("InputCapture: CreateSession from {}", app_id);
+        log::info!("InputCapture: CreateSession from {} (parent: {})", app_id, parent_window);
         let session_data = SessionData {
             state: Some(SessionState::Created),
             ..Default::default()

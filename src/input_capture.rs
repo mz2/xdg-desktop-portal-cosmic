@@ -370,6 +370,7 @@ impl InputCapture {
     }
 
     // ConnectToEIS - returns Unix fd for EIS connection
+    #[zbus(name = "ConnectToEIS")]
     async fn connect_to_eis(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,

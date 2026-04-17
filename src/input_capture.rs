@@ -370,6 +370,11 @@ impl InputCapture {
     }
 
     // ConnectToEIS - returns Unix fd for EIS connection
+    //
+    // The compositor (cosmic-comp) runs the EIS server. We ask it to create
+    // a socketpair via its private D-Bus interface. The compositor keeps the
+    // server end (for sending input events) and returns the client end, which
+    // we pass back to the xdg-desktop-portal frontend for Deskflow.
     #[zbus(name = "ConnectToEIS")]
     async fn connect_to_eis(
         &self,
@@ -384,18 +389,30 @@ impl InputCapture {
             return Err(zbus::fdo::Error::Failed("Session not found".into()));
         };
 
-        // Create Unix socketpair
-        let (client_stream, _server_stream) = std::os::unix::net::UnixStream::pair()
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to create socketpair: {}", e)))?;
-
-        // TODO: Pass server_stream to compositor for EIS server context via private D-Bus
-
         log::info!("InputCapture: ConnectToEIS for session {}", session_handle);
 
-        use std::os::unix::io::{FromRawFd, IntoRawFd};
-        // SAFETY: client_stream.into_raw_fd() yields a valid, owned fd
-        let owned_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(client_stream.into_raw_fd()) };
-        Ok(zbus::zvariant::OwnedFd::from(owned_fd))
+        // Ask the compositor to create the socketpair and EIS server context.
+        // It keeps the server end and returns the client end.
+        let compositor_conn = zbus::Connection::session().await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Session bus: {}", e)))?;
+
+        let reply = compositor_conn
+            .call_method(
+                Some("org.cosmic.InputCapture"),
+                "/org/cosmic/InputCapture",
+                Some("org.cosmic.InputCapture"),
+                "ConnectToEIS",
+                &(session_handle.as_str(),),
+            )
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Compositor ConnectToEIS: {}", e)))?;
+
+        let client_fd: zbus::zvariant::OwnedFd = reply.body().deserialize()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("fd deserialize: {}", e)))?;
+
+        log::info!("InputCapture: Got EIS client fd from compositor for session {}", session_handle);
+
+        Ok(client_fd)
     }
 
     // Signals

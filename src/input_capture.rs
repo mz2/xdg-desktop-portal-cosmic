@@ -186,38 +186,34 @@ impl InputCapture {
         };
 
         // Get zones from compositor via private D-Bus interface
-        let (zones, zone_set) = match zbus::Connection::session().await {
-            Ok(conn) => {
-                match conn.call_method(
-                    Some("org.cosmic.InputCapture"),
-                    "/org/cosmic/InputCapture",
-                    Some("org.cosmic.InputCapture"),
-                    "GetZones",
-                    &(session_handle.as_str(),),
-                ).await {
-                    Ok(reply) => {
-                        match reply.body().deserialize::<(u32, Vec<(u32, u32, i32, i32)>)>() {
-                            Ok((zs, z)) => {
-                                log::info!("InputCapture: GetZones from compositor: zone_set={}, {} zones", zs, z.len());
-                                (z, zs)
-                            }
-                            Err(e) => {
-                                log::warn!("InputCapture: Failed to deserialize zones: {}", e);
-                                (vec![(1920, 1080, 0, 0)], 1)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("InputCapture: Compositor GetZones failed: {}", e);
-                        (vec![(1920, 1080, 0, 0)], 1)
-                    }
-                }
-            }
+        let conn = zbus::Connection::session().await
+            .map_err(|e| log::error!("InputCapture: GetZones session bus failed: {}", e))
+            .ok();
+        let Some(conn) = conn else {
+            return PortalResponse::Other;
+        };
+        let reply = conn.call_method(
+            Some("org.cosmic.InputCapture"),
+            "/org/cosmic/InputCapture",
+            Some("org.cosmic.InputCapture"),
+            "GetZones",
+            &(session_handle.as_str(),),
+        ).await;
+        let reply = match reply {
+            Ok(r) => r,
             Err(e) => {
-                log::warn!("InputCapture: Session bus failed: {}", e);
-                (vec![(1920, 1080, 0, 0)], 1)
+                log::error!("InputCapture: Compositor GetZones failed: {}", e);
+                return PortalResponse::Other;
             }
         };
+        let (zone_set, zones) = match reply.body().deserialize::<(u32, Vec<(u32, u32, i32, i32)>)>() {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("InputCapture: Failed to deserialize zones: {}", e);
+                return PortalResponse::Other;
+            }
+        };
+        log::info!("InputCapture: GetZones: zone_set={}, {} zones", zone_set, zones.len());
 
         interface.get_mut().await.zone_set = zone_set;
 

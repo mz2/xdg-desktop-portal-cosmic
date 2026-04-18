@@ -419,16 +419,33 @@ impl InputCapture {
         let mut session_data = interface.get_mut().await;
 
         // Extract activation_id and cursor_position from options
-        let _activation_id = options
+        let activation_id = options
             .get("activation_id")
-            .and_then(|v| <u32>::try_from(v).ok());
-        let _cursor_position = options
+            .and_then(|v| <u32>::try_from(v).ok())
+            .unwrap_or(0);
+        let cursor_position = options
             .get("cursor_position")
-            .and_then(|v| <(f64, f64)>::try_from(v.clone()).ok());
+            .and_then(|v| <(f64, f64)>::try_from(v.clone()).ok())
+            .unwrap_or((0.0, 0.0));
 
         session_data.state = Some(SessionState::Disabled);
-        log::info!("InputCapture: Released for session {}", session_handle);
-        // TODO: Forward Release to compositor with cursor_position via private D-Bus
+        log::info!(
+            "InputCapture: Released for session {} (activation_id={}, cursor=({},{}))",
+            session_handle, activation_id, cursor_position.0, cursor_position.1
+        );
+
+        // Forward Release to compositor so it stops capturing and warps cursor
+        let sid = session_handle.to_string();
+        drop(session_data);
+        if let Ok(conn) = zbus::Connection::session().await {
+            let _ = conn.call_method(
+                Some("org.cosmic.InputCapture"),
+                "/org/cosmic/InputCapture",
+                Some("org.cosmic.InputCapture"),
+                "Release",
+                &(sid.as_str(), activation_id, cursor_position),
+            ).await.map_err(|e| log::warn!("Compositor Release failed: {}", e));
+        }
         Ok(())
     }
 

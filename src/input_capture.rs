@@ -270,7 +270,24 @@ impl InputCapture {
             }
         }
 
-        session_data.barriers = valid_barriers;
+        session_data.barriers = valid_barriers.clone();
+
+        // Forward barriers to compositor
+        let sid = session_handle.to_string();
+        let compositor_barriers: Vec<(u32, (i32, i32, i32, i32))> = valid_barriers
+            .iter()
+            .map(|b| (b.id, (b.x1, b.y1, b.x2, b.y2)))
+            .collect();
+        drop(session_data);
+        if let Ok(conn) = zbus::Connection::session().await {
+            let _ = conn.call_method(
+                Some("org.cosmic.InputCapture"),
+                "/org/cosmic/InputCapture",
+                Some("org.cosmic.InputCapture"),
+                "SetBarriers",
+                &(sid.as_str(), zone_set, compositor_barriers),
+            ).await.map_err(|e| log::warn!("Compositor SetBarriers failed: {}", e));
+        }
 
         PortalResponse::Success(SetPointerBarriersResult { failed_barriers })
     }
@@ -294,7 +311,18 @@ impl InputCapture {
             Some(SessionState::Disabled) | Some(SessionState::Started) | Some(SessionState::Created) => {
                 session_data.state = Some(SessionState::Enabled);
                 log::info!("InputCapture: Enabled for session {}", session_handle);
-                // TODO: Forward Enable to compositor via private D-Bus
+                // Forward to compositor
+                let sid = session_handle.to_string();
+                drop(session_data);
+                if let Ok(conn) = zbus::Connection::session().await {
+                    let _ = conn.call_method(
+                        Some("org.cosmic.InputCapture"),
+                        "/org/cosmic/InputCapture",
+                        Some("org.cosmic.InputCapture"),
+                        "Enable",
+                        &(sid.as_str(),),
+                    ).await.map_err(|e| log::warn!("Compositor Enable failed: {}", e));
+                }
                 Ok(())
             }
             _ => {
@@ -326,7 +354,17 @@ impl InputCapture {
             Some(SessionState::Enabled) => {
                 session_data.state = Some(SessionState::Disabled);
                 log::info!("InputCapture: Disabled for session {}", session_handle);
-                // TODO: Forward Disable to compositor via private D-Bus
+                let sid = session_handle.to_string();
+                drop(session_data);
+                if let Ok(conn) = zbus::Connection::session().await {
+                    let _ = conn.call_method(
+                        Some("org.cosmic.InputCapture"),
+                        "/org/cosmic/InputCapture",
+                        Some("org.cosmic.InputCapture"),
+                        "Disable",
+                        &(sid.as_str(),),
+                    ).await.map_err(|e| log::warn!("Compositor Disable failed: {}", e));
+                }
                 Ok(())
             }
             _ => {

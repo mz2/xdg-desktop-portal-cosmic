@@ -1,8 +1,10 @@
 #![allow(dead_code, unused_variables)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use futures::TryStreamExt;
 use tokio::sync::mpsc::Sender;
-use zbus::zvariant;
+use zbus::zvariant::{self, OwnedObjectPath, OwnedValue};
 
 use crate::{PortalResponse, Request, subscription};
 
@@ -82,6 +84,10 @@ impl SessionData {
     }
 }
 
+/// Reverse mapping from compositor session ID to portal session handle (ObjectPath).
+/// Shared between the main struct and the signal relay task.
+type SessionMap = Arc<Mutex<HashMap<String, OwnedObjectPath>>>;
+
 // Main InputCapture struct
 pub struct InputCapture {
     tx: Sender<subscription::Event>,
@@ -89,6 +95,10 @@ pub struct InputCapture {
     /// We cannot reuse the injected zbus connection because calling another service
     /// from within a D-Bus method handler on the same connection deadlocks.
     compositor_conn: tokio::sync::OnceCell<zbus::Connection>,
+    /// Maps compositor session_id -> portal session_handle ObjectPath.
+    session_map: SessionMap,
+    /// Ensures the signal relay background task is spawned only once.
+    relay_started: AtomicBool,
 }
 
 impl InputCapture {
@@ -96,6 +106,8 @@ impl InputCapture {
         Self {
             tx,
             compositor_conn: tokio::sync::OnceCell::new(),
+            session_map: Arc::new(Mutex::new(HashMap::new())),
+            relay_started: AtomicBool::new(false),
         }
     }
 
@@ -156,6 +168,14 @@ impl InputCapture {
             None => None,
         };
 
+        // Store reverse mapping: compositor session_id -> portal session_handle
+        if let Some(ref comp_sid) = compositor_session_id {
+            self.session_map
+                .lock()
+                .unwrap()
+                .insert(comp_sid.clone(), session_handle.to_owned().into());
+        }
+
         let session_data = SessionData {
             state: Some(SessionState::Created),
             compositor_session_id,
@@ -169,6 +189,18 @@ impl InputCapture {
             )
             .await
             .unwrap();
+
+        // Start the compositor signal relay task (once).
+        if !self.relay_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if let Some(comp_conn) = self.comp_conn().await.cloned() {
+                let portal_conn = connection.clone();
+                let session_map = Arc::clone(&self.session_map);
+                tokio::spawn(async move {
+                    signal_relay_loop(comp_conn, portal_conn, session_map).await;
+                });
+            }
+        }
+
         PortalResponse::Success(CreateSessionResult {
             session_id: session_handle.to_string(),
             capabilities: CAPABILITY_KEYBOARD | CAPABILITY_POINTER,
@@ -594,5 +626,214 @@ impl InputCapture {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         2
+    }
+}
+
+/// Background task: subscribes to compositor `org.cosmic.InputCapture` signals
+/// and re-emits them on the portal backend interface so that xdg-desktop-portal
+/// can relay them to clients (e.g. Deskflow).
+async fn signal_relay_loop(
+    comp_conn: zbus::Connection,
+    portal_conn: zbus::Connection,
+    session_map: SessionMap,
+) {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.cosmic.InputCapture")
+        .unwrap()
+        .path("/org/cosmic/InputCapture")
+        .unwrap()
+        .interface("org.cosmic.InputCapture")
+        .unwrap()
+        .build();
+
+    let mut stream = match zbus::MessageStream::for_match_rule(rule, &comp_conn, None).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("InputCapture: Failed to subscribe to compositor signals: {}", e);
+            return;
+        }
+    };
+
+    log::warn!("InputCapture: Signal relay task started");
+
+    loop {
+        let msg = match stream.try_next().await {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("InputCapture: Signal stream error: {}", e);
+                continue;
+            }
+        };
+
+        let member = msg.header().member().map(|m| m.as_str().to_string());
+
+        match member.as_deref() {
+            Some("Activated") => {
+                let body = match msg
+                    .body()
+                    .deserialize::<(String, u32, u32, (f64, f64))>()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("InputCapture: Failed to deserialize Activated: {}", e);
+                        continue;
+                    }
+                };
+                let (session_id, barrier_id, activation_id, cursor_position) = body;
+
+                let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
+                let Some(portal_handle) = portal_handle else {
+                    log::warn!(
+                        "InputCapture: No portal session for compositor session_id={}",
+                        session_id
+                    );
+                    continue;
+                };
+
+                let mut options: HashMap<String, OwnedValue> = HashMap::new();
+                options.insert(
+                    "activation_id".to_string(),
+                    zvariant::Value::from(activation_id).try_to_owned().unwrap(),
+                );
+                options.insert(
+                    "cursor_position".to_string(),
+                    zvariant::Value::from((cursor_position.0, cursor_position.1))
+                        .try_to_owned()
+                        .unwrap(),
+                );
+                if barrier_id != 0 {
+                    options.insert(
+                        "barrier_id".to_string(),
+                        zvariant::Value::from(barrier_id).try_to_owned().unwrap(),
+                    );
+                }
+
+                log::warn!(
+                    "InputCapture: Relaying Activated for session {} (activation_id={}, barrier_id={}, cursor=({},{}))",
+                    session_id, activation_id, barrier_id, cursor_position.0, cursor_position.1
+                );
+
+                emit_portal_signal(&portal_conn, portal_handle.as_ref(), "Activated", &options)
+                    .await;
+            }
+            Some("Deactivated") => {
+                let body = match msg.body().deserialize::<(String, u32)>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("InputCapture: Failed to deserialize Deactivated: {}", e);
+                        continue;
+                    }
+                };
+                let (session_id, activation_id) = body;
+
+                let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
+                let Some(portal_handle) = portal_handle else {
+                    log::warn!(
+                        "InputCapture: No portal session for compositor session_id={}",
+                        session_id
+                    );
+                    continue;
+                };
+
+                let mut options: HashMap<String, OwnedValue> = HashMap::new();
+                options.insert(
+                    "activation_id".to_string(),
+                    zvariant::Value::from(activation_id).try_to_owned().unwrap(),
+                );
+
+                log::warn!(
+                    "InputCapture: Relaying Deactivated for session {} (activation_id={})",
+                    session_id, activation_id
+                );
+
+                emit_portal_signal(&portal_conn, portal_handle.as_ref(), "Deactivated", &options)
+                    .await;
+            }
+            Some("DisabledSignal") => {
+                let body = match msg.body().deserialize::<(String,)>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("InputCapture: Failed to deserialize DisabledSignal: {}", e);
+                        continue;
+                    }
+                };
+                let (session_id,) = body;
+
+                let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
+                let Some(portal_handle) = portal_handle else {
+                    log::warn!(
+                        "InputCapture: No portal session for compositor session_id={}",
+                        session_id
+                    );
+                    continue;
+                };
+
+                let options: HashMap<String, OwnedValue> = HashMap::new();
+
+                log::warn!(
+                    "InputCapture: Relaying Disabled for session {}",
+                    session_id
+                );
+
+                emit_portal_signal(&portal_conn, portal_handle.as_ref(), "Disabled", &options)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    log::warn!("InputCapture: Signal relay task ended");
+}
+
+/// Emit a signal on the portal's `org.freedesktop.impl.portal.InputCapture` interface
+/// using the portal connection's object server and the generated signal methods.
+async fn emit_portal_signal(
+    portal_conn: &zbus::Connection,
+    session_handle: zvariant::ObjectPath<'_>,
+    signal_name: &str,
+    options: &HashMap<String, OwnedValue>,
+) {
+    let iface_ref = portal_conn
+        .object_server()
+        .interface::<_, InputCapture>("/org/freedesktop/portal/desktop")
+        .await;
+
+    match iface_ref {
+        Ok(iface_ref) => {
+            let ctxt = iface_ref.signal_emitter();
+            let iface = iface_ref.get().await;
+            let result = match signal_name {
+                "Activated" => {
+                    iface
+                        .activated(ctxt, session_handle, options.clone())
+                        .await
+                }
+                "Deactivated" => {
+                    iface
+                        .deactivated(ctxt, session_handle, options.clone())
+                        .await
+                }
+                "Disabled" => {
+                    iface
+                        .disabled(ctxt, session_handle, options.clone())
+                        .await
+                }
+                other => {
+                    log::warn!("InputCapture: Unknown signal to relay: {}", other);
+                    return;
+                }
+            };
+            if let Err(e) = result {
+                log::warn!("InputCapture: Failed to emit {} signal: {}", signal_name, e);
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "InputCapture: Could not get interface ref for signal emission: {}",
+                e
+            );
+        }
     }
 }

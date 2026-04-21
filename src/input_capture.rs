@@ -85,11 +85,29 @@ impl SessionData {
 // Main InputCapture struct
 pub struct InputCapture {
     tx: Sender<subscription::Event>,
+    /// Dedicated D-Bus connection for calling the compositor's InputCapture service.
+    /// We cannot reuse the injected zbus connection because calling another service
+    /// from within a D-Bus method handler on the same connection deadlocks.
+    compositor_conn: tokio::sync::OnceCell<zbus::Connection>,
 }
 
 impl InputCapture {
     pub fn new(tx: Sender<subscription::Event>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            compositor_conn: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn comp_conn(&self) -> Option<&zbus::Connection> {
+        self.compositor_conn
+            .get_or_try_init(|| async {
+                log::warn!("InputCapture: Creating dedicated compositor D-Bus connection");
+                zbus::Connection::session().await
+            })
+            .await
+            .map_err(|e| log::error!("InputCapture: Failed to create compositor connection: {}", e))
+            .ok()
     }
 }
 
@@ -109,14 +127,15 @@ impl InputCapture {
         log::info!("InputCapture: CreateSession from {} (parent: {})", app_id, parent_window);
 
         // Create a session on the compositor first to get its session ID.
-        // Reuse the injected D-Bus connection to avoid deadlocks.
-        let compositor_session_id = match connection.call_method(
-            Some("org.cosmic.InputCapture"),
-            "/org/cosmic/InputCapture",
-            Some("org.cosmic.InputCapture"),
-            "CreateSession",
-            &(CAPABILITY_KEYBOARD | CAPABILITY_POINTER,),
-        ).await {
+        // Use a dedicated connection — the injected one deadlocks on cross-service calls.
+        let compositor_session_id = match self.comp_conn().await {
+            Some(comp) => match comp.call_method(
+                Some("org.cosmic.InputCapture"),
+                "/org/cosmic/InputCapture",
+                Some("org.cosmic.InputCapture"),
+                "CreateSession",
+                &(CAPABILITY_KEYBOARD | CAPABILITY_POINTER,),
+            ).await {
             Ok(reply) => {
                 match reply.body().deserialize::<String>() {
                     Ok(id) => {
@@ -133,6 +152,8 @@ impl InputCapture {
                 log::warn!("InputCapture: Compositor CreateSession failed: {}", e);
                 None
             }
+            },
+            None => None,
         };
 
         let session_data = SessionData {
@@ -220,7 +241,11 @@ impl InputCapture {
         let comp_sid = interface.get().await.compositor_session_id.clone().unwrap_or_default();
 
         // Get zones from compositor via private D-Bus interface
-        let reply = connection.call_method(
+        let Some(comp) = self.comp_conn().await else {
+            log::error!("InputCapture: No compositor connection for GetZones");
+            return PortalResponse::Other;
+        };
+        let reply = comp.call_method(
             Some("org.cosmic.InputCapture"),
             "/org/cosmic/InputCapture",
             Some("org.cosmic.InputCapture"),
@@ -333,13 +358,13 @@ impl InputCapture {
             .collect();
         drop(session_data);
         { 
-            let _ = connection.call_method(
+            if let Some(comp) = self.comp_conn().await { let _ = comp.call_method(
                 Some("org.cosmic.InputCapture"),
                 "/org/cosmic/InputCapture",
                 Some("org.cosmic.InputCapture"),
                 "SetBarriers",
                 &(sid.as_str(), zone_set, compositor_barriers),
-            ).await.map_err(|e| log::warn!("Compositor SetBarriers failed: {}", e));
+            ).await.map_err(|e| log::warn!("Compositor SetBarriers failed: {}", e)); }
         }
 
         PortalResponse::Success(SetPointerBarriersResult { failed_barriers })
@@ -368,13 +393,13 @@ impl InputCapture {
                 let sid = session_data.compositor_session_id.clone().unwrap_or_default();
                 drop(session_data);
                 { 
-                    let _ = connection.call_method(
+                    if let Some(comp) = self.comp_conn().await { let _ = comp.call_method(
                         Some("org.cosmic.InputCapture"),
                         "/org/cosmic/InputCapture",
                         Some("org.cosmic.InputCapture"),
                         "Enable",
                         &(sid.as_str(),),
-                    ).await.map_err(|e| log::warn!("Compositor Enable failed: {}", e));
+                    ).await.map_err(|e| log::warn!("Compositor Enable failed: {}", e)); }
                 }
                 Ok(())
             }
@@ -410,13 +435,13 @@ impl InputCapture {
                 let sid = session_data.compositor_session_id.clone().unwrap_or_default();
                 drop(session_data);
                 { 
-                    let _ = connection.call_method(
+                    if let Some(comp) = self.comp_conn().await { let _ = comp.call_method(
                         Some("org.cosmic.InputCapture"),
                         "/org/cosmic/InputCapture",
                         Some("org.cosmic.InputCapture"),
                         "Disable",
                         &(sid.as_str(),),
-                    ).await.map_err(|e| log::warn!("Compositor Disable failed: {}", e));
+                    ).await.map_err(|e| log::warn!("Compositor Disable failed: {}", e)); }
                 }
                 Ok(())
             }
@@ -466,13 +491,13 @@ impl InputCapture {
         let sid = session_data.compositor_session_id.clone().unwrap_or_default();
         drop(session_data);
         { 
-            let _ = connection.call_method(
+            if let Some(comp) = self.comp_conn().await { let _ = comp.call_method(
                 Some("org.cosmic.InputCapture"),
                 "/org/cosmic/InputCapture",
                 Some("org.cosmic.InputCapture"),
                 "Release",
                 &(sid.as_str(), activation_id, cursor_position),
-            ).await.map_err(|e| log::warn!("Compositor Release failed: {}", e));
+            ).await.map_err(|e| log::warn!("Compositor Release failed: {}", e)); }
         }
         Ok(())
     }
@@ -506,7 +531,9 @@ impl InputCapture {
 
         // Ask the compositor to create the socketpair and EIS server context.
         // It keeps the server end and returns the client end.
-        let reply = connection
+        let comp = self.comp_conn().await
+            .ok_or_else(|| zbus::fdo::Error::Failed("No compositor connection".into()))?;
+        let reply = comp
             .call_method(
                 Some("org.cosmic.InputCapture"),
                 "/org/cosmic/InputCapture",

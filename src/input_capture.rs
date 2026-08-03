@@ -114,11 +114,11 @@ impl InputCapture {
     async fn comp_conn(&self) -> Option<&zbus::Connection> {
         self.compositor_conn
             .get_or_try_init(|| async {
-                log::warn!("InputCapture: Creating dedicated compositor D-Bus connection");
+                tracing::warn!("InputCapture: Creating dedicated compositor D-Bus connection");
                 zbus::Connection::session().await
             })
             .await
-            .map_err(|e| log::error!("InputCapture: Failed to create compositor connection: {}", e))
+            .map_err(|e| tracing::error!("InputCapture: Failed to create compositor connection: {}", e))
             .ok()
     }
 }
@@ -136,7 +136,7 @@ impl InputCapture {
         parent_window: String,
         options: HashMap<String, zvariant::OwnedValue>,
     ) -> PortalResponse<CreateSessionResult> {
-        log::info!("InputCapture: CreateSession from {} (parent: {})", app_id, parent_window);
+        tracing::info!("InputCapture: CreateSession from {} (parent: {})", app_id, parent_window);
 
         // Create a session on the compositor first to get its session ID.
         // Use a dedicated connection — the injected one deadlocks on cross-service calls.
@@ -151,17 +151,17 @@ impl InputCapture {
             Ok(reply) => {
                 match reply.body().deserialize::<String>() {
                     Ok(id) => {
-                        log::warn!("InputCapture: Compositor session ID: {}", id);
+                        tracing::warn!("InputCapture: Compositor session ID: {}", id);
                         Some(id)
                     }
                     Err(e) => {
-                        log::warn!("InputCapture: Failed to get compositor session ID: {}", e);
+                        tracing::warn!("InputCapture: Failed to get compositor session ID: {}", e);
                         None
                     }
                 }
             }
             Err(e) => {
-                log::warn!("InputCapture: Compositor CreateSession failed: {}", e);
+                tracing::warn!("InputCapture: Compositor CreateSession failed: {}", e);
                 None
             }
             },
@@ -228,7 +228,7 @@ impl InputCapture {
             {
                 let mut session_data = interface.get_mut().await;
                 if session_data.state != Some(SessionState::Created) {
-                    log::warn!(
+                    tracing::warn!(
                         "InputCapture: Start called in invalid state: {:?}",
                         session_data.state
                     );
@@ -244,7 +244,7 @@ impl InputCapture {
 
             // TODO: Show permission dialog via self.tx channel
             // For now, auto-approve (we'll add the dialog later)
-            log::info!("InputCapture: Start approved for {}", app_id);
+            tracing::info!("InputCapture: Start approved for {}", app_id);
 
             let caps = interface.get().await.capabilities;
             PortalResponse::Success(StartResult {
@@ -274,7 +274,7 @@ impl InputCapture {
 
         // Get zones from compositor via private D-Bus interface
         let Some(comp) = self.comp_conn().await else {
-            log::error!("InputCapture: No compositor connection for GetZones");
+            tracing::error!("InputCapture: No compositor connection for GetZones");
             return PortalResponse::Other;
         };
         let reply = comp.call_method(
@@ -287,18 +287,18 @@ impl InputCapture {
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
-                log::error!("InputCapture: Compositor GetZones failed: {}", e);
+                tracing::error!("InputCapture: Compositor GetZones failed: {}", e);
                 return PortalResponse::Other;
             }
         };
         let (zone_set, zones) = match reply.body().deserialize::<(u32, Vec<(u32, u32, i32, i32)>)>() {
             Ok(v) => v,
             Err(e) => {
-                log::error!("InputCapture: Failed to deserialize zones: {}", e);
+                tracing::error!("InputCapture: Failed to deserialize zones: {}", e);
                 return PortalResponse::Other;
             }
         };
-        log::info!("InputCapture: GetZones: zone_set={}, {} zones", zone_set, zones.len());
+        tracing::info!("InputCapture: GetZones: zone_set={}, {} zones", zone_set, zones.len());
 
         interface.get_mut().await.zone_set = zone_set;
 
@@ -326,7 +326,7 @@ impl InputCapture {
 
         // Check zone_set matches
         if zone_set != session_data.zone_set {
-            log::warn!(
+            tracing::warn!(
                 "InputCapture: SetPointerBarriers zone_set mismatch: {} != {}",
                 zone_set,
                 session_data.zone_set
@@ -355,13 +355,13 @@ impl InputCapture {
                 Some((x1, y1, x2, y2)) => {
                     // Validate: must be axis-aligned
                     if x1 != x2 && y1 != y2 {
-                        log::warn!("InputCapture: Barrier {} is not axis-aligned", barrier_id);
+                        tracing::warn!("InputCapture: Barrier {} is not axis-aligned", barrier_id);
                         failed_barriers.push(barrier_id);
                         continue;
                     }
                     // Validate: must not be a point
                     if x1 == x2 && y1 == y2 {
-                        log::warn!("InputCapture: Barrier {} is a point", barrier_id);
+                        tracing::warn!("InputCapture: Barrier {} is a point", barrier_id);
                         failed_barriers.push(barrier_id);
                         continue;
                     }
@@ -396,7 +396,7 @@ impl InputCapture {
                 Some("org.cosmic.InputCapture"),
                 "SetBarriers",
                 &(sid.as_str(), zone_set, compositor_barriers),
-            ).await.map_err(|e| log::warn!("Compositor SetBarriers failed: {}", e)); }
+            ).await.map_err(|e| tracing::warn!("Compositor SetBarriers failed: {}", e)); }
         }
 
         PortalResponse::Success(SetPointerBarriersResult { failed_barriers })
@@ -420,7 +420,7 @@ impl InputCapture {
         match session_data.state {
             Some(SessionState::Disabled) | Some(SessionState::Started) | Some(SessionState::Created) => {
                 session_data.state = Some(SessionState::Enabled);
-                log::info!("InputCapture: Enabled for session {}", session_handle);
+                tracing::info!("InputCapture: Enabled for session {}", session_handle);
                 // Forward to compositor using its session ID
                 let sid = session_data.compositor_session_id.clone().unwrap_or_default();
                 drop(session_data);
@@ -431,12 +431,12 @@ impl InputCapture {
                         Some("org.cosmic.InputCapture"),
                         "Enable",
                         &(sid.as_str(),),
-                    ).await.map_err(|e| log::warn!("Compositor Enable failed: {}", e)); }
+                    ).await.map_err(|e| tracing::warn!("Compositor Enable failed: {}", e)); }
                 }
                 Ok(())
             }
             _ => {
-                log::warn!(
+                tracing::warn!(
                     "InputCapture: Enable called in invalid state: {:?}",
                     session_data.state
                 );
@@ -463,7 +463,7 @@ impl InputCapture {
         match session_data.state {
             Some(SessionState::Enabled) => {
                 session_data.state = Some(SessionState::Disabled);
-                log::info!("InputCapture: Disabled for session {}", session_handle);
+                tracing::info!("InputCapture: Disabled for session {}", session_handle);
                 let sid = session_data.compositor_session_id.clone().unwrap_or_default();
                 drop(session_data);
                 { 
@@ -473,12 +473,12 @@ impl InputCapture {
                         Some("org.cosmic.InputCapture"),
                         "Disable",
                         &(sid.as_str(),),
-                    ).await.map_err(|e| log::warn!("Compositor Disable failed: {}", e)); }
+                    ).await.map_err(|e| tracing::warn!("Compositor Disable failed: {}", e)); }
                 }
                 Ok(())
             }
             _ => {
-                log::warn!(
+                tracing::warn!(
                     "InputCapture: Disable called in invalid state: {:?}",
                     session_data.state
                 );
@@ -514,7 +514,7 @@ impl InputCapture {
             .unwrap_or((0.0, 0.0));
 
         session_data.state = Some(SessionState::Disabled);
-        log::info!(
+        tracing::info!(
             "InputCapture: Released for session {} (activation_id={}, cursor=({},{}))",
             session_handle, activation_id, cursor_position.0, cursor_position.1
         );
@@ -529,7 +529,7 @@ impl InputCapture {
                 Some("org.cosmic.InputCapture"),
                 "Release",
                 &(sid.as_str(), activation_id, cursor_position),
-            ).await.map_err(|e| log::warn!("Compositor Release failed: {}", e)); }
+            ).await.map_err(|e| tracing::warn!("Compositor Release failed: {}", e)); }
         }
         Ok(())
     }
@@ -559,7 +559,7 @@ impl InputCapture {
             let data = _interface.get().await;
             data.compositor_session_id.clone().unwrap_or_default()
         };
-        log::info!("InputCapture: ConnectToEIS for session {} (compositor: {})", session_handle, comp_sid);
+        tracing::info!("InputCapture: ConnectToEIS for session {} (compositor: {})", session_handle, comp_sid);
 
         // Ask the compositor to create the socketpair and EIS server context.
         // It keeps the server end and returns the client end.
@@ -579,7 +579,7 @@ impl InputCapture {
         let client_fd: zbus::zvariant::OwnedFd = reply.body().deserialize()
             .map_err(|e| zbus::fdo::Error::Failed(format!("fd deserialize: {}", e)))?;
 
-        log::info!("InputCapture: Got EIS client fd from compositor for session {}", session_handle);
+        tracing::info!("InputCapture: Got EIS client fd from compositor for session {}", session_handle);
 
         Ok(client_fd)
     }
@@ -650,19 +650,19 @@ async fn signal_relay_loop(
     let mut stream = match zbus::MessageStream::for_match_rule(rule, &comp_conn, None).await {
         Ok(s) => s,
         Err(e) => {
-            log::error!("InputCapture: Failed to subscribe to compositor signals: {}", e);
+            tracing::error!("InputCapture: Failed to subscribe to compositor signals: {}", e);
             return;
         }
     };
 
-    log::warn!("InputCapture: Signal relay task started");
+    tracing::warn!("InputCapture: Signal relay task started");
 
     loop {
         let msg = match stream.try_next().await {
             Ok(Some(m)) => m,
             Ok(None) => break,
             Err(e) => {
-                log::warn!("InputCapture: Signal stream error: {}", e);
+                tracing::warn!("InputCapture: Signal stream error: {}", e);
                 continue;
             }
         };
@@ -677,7 +677,7 @@ async fn signal_relay_loop(
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        log::warn!("InputCapture: Failed to deserialize Activated: {}", e);
+                        tracing::warn!("InputCapture: Failed to deserialize Activated: {}", e);
                         continue;
                     }
                 };
@@ -685,7 +685,7 @@ async fn signal_relay_loop(
 
                 let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
                 let Some(portal_handle) = portal_handle else {
-                    log::warn!(
+                    tracing::warn!(
                         "InputCapture: No portal session for compositor session_id={}",
                         session_id
                     );
@@ -710,7 +710,7 @@ async fn signal_relay_loop(
                     );
                 }
 
-                log::warn!(
+                tracing::warn!(
                     "InputCapture: Relaying Activated for session {} (activation_id={}, barrier_id={}, cursor=({},{}))",
                     session_id, activation_id, barrier_id, cursor_position.0, cursor_position.1
                 );
@@ -722,7 +722,7 @@ async fn signal_relay_loop(
                 let body = match msg.body().deserialize::<(String, u32)>() {
                     Ok(v) => v,
                     Err(e) => {
-                        log::warn!("InputCapture: Failed to deserialize Deactivated: {}", e);
+                        tracing::warn!("InputCapture: Failed to deserialize Deactivated: {}", e);
                         continue;
                     }
                 };
@@ -730,7 +730,7 @@ async fn signal_relay_loop(
 
                 let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
                 let Some(portal_handle) = portal_handle else {
-                    log::warn!(
+                    tracing::warn!(
                         "InputCapture: No portal session for compositor session_id={}",
                         session_id
                     );
@@ -743,7 +743,7 @@ async fn signal_relay_loop(
                     zvariant::Value::from(activation_id).try_to_owned().unwrap(),
                 );
 
-                log::warn!(
+                tracing::warn!(
                     "InputCapture: Relaying Deactivated for session {} (activation_id={})",
                     session_id, activation_id
                 );
@@ -755,7 +755,7 @@ async fn signal_relay_loop(
                 let body = match msg.body().deserialize::<(String,)>() {
                     Ok(v) => v,
                     Err(e) => {
-                        log::warn!("InputCapture: Failed to deserialize DisabledSignal: {}", e);
+                        tracing::warn!("InputCapture: Failed to deserialize DisabledSignal: {}", e);
                         continue;
                     }
                 };
@@ -763,7 +763,7 @@ async fn signal_relay_loop(
 
                 let portal_handle = session_map.lock().unwrap().get(&session_id).cloned();
                 let Some(portal_handle) = portal_handle else {
-                    log::warn!(
+                    tracing::warn!(
                         "InputCapture: No portal session for compositor session_id={}",
                         session_id
                     );
@@ -772,7 +772,7 @@ async fn signal_relay_loop(
 
                 let options: HashMap<String, OwnedValue> = HashMap::new();
 
-                log::warn!(
+                tracing::warn!(
                     "InputCapture: Relaying Disabled for session {}",
                     session_id
                 );
@@ -784,7 +784,7 @@ async fn signal_relay_loop(
         }
     }
 
-    log::warn!("InputCapture: Signal relay task ended");
+    tracing::warn!("InputCapture: Signal relay task ended");
 }
 
 /// Emit a signal on the portal's `org.freedesktop.impl.portal.InputCapture` interface
@@ -821,16 +821,16 @@ async fn emit_portal_signal(
                         .await
                 }
                 other => {
-                    log::warn!("InputCapture: Unknown signal to relay: {}", other);
+                    tracing::warn!("InputCapture: Unknown signal to relay: {}", other);
                     return;
                 }
             };
             if let Err(e) = result {
-                log::warn!("InputCapture: Failed to emit {} signal: {}", signal_name, e);
+                tracing::warn!("InputCapture: Failed to emit {} signal: {}", signal_name, e);
             }
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "InputCapture: Could not get interface ref for signal emission: {}",
                 e
             );
